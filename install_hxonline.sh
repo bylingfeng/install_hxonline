@@ -33,18 +33,25 @@ download_file() {
     local url="$1"
     local output="$2"
     rm -f "$output"
+
     if [ -t 1 ]; then
         echo "下载地址：$url"
         if command -v curl &> /dev/null; then
             curl -fL --progress-bar "$url" -o "$output"
-        else
+        elif command -v wget &> /dev/null; then
             wget --show-progress "$url" -O "$output"
+        else
+            echo "错误：系统中未找到 curl 或 wget，无法下载文件。"
+            exit 1
         fi
     else
         if command -v curl &> /dev/null; then
             curl -fsSL "$url" -o "$output"
-        else
+        elif command -v wget &> /dev/null; then
             wget -q "$url" -O "$output"
+        else
+            echo "错误：系统中未找到 curl 或 wget，无法下载文件。"
+            exit 1
         fi
     fi
     return $?
@@ -67,7 +74,7 @@ fi
 chmod +x "$DOWNLOAD_PATH"
 echo "已赋予可执行权限。"
 
-# ========== 4. 启动服务（root 直接运行，带重试） ==========
+# ========== 4. 通用端口清理（兼容所有发行版） ==========
 CMD="./hxonline --wss 0 --model=product --port $PORT"
 LOG_FILE="$WORK_DIR/console.log"
 
@@ -77,8 +84,7 @@ log() {
 
 log "=== 开始启动 hxonline（root 模式） ==="
 
-log "正在清理端口 $PORT 上的占用进程..."
-
+# 超时命令兼容（部分系统默认没有 timeout）
 if ! command -v timeout &> /dev/null; then
     timeout() {
         local seconds=$1
@@ -91,29 +97,68 @@ if ! command -v timeout &> /dev/null; then
     }
 fi
 
-if command -v lsof &> /dev/null; then
-    PIDS=$(timeout 5 lsof -ti :"$PORT" 2>/dev/null) || true
-    if [ -n "$PIDS" ]; then
-        echo "发现占用进程 PID: $PIDS，正在强制终止..."
-        kill -9 $PIDS 2>/dev/null || true
-        sleep 1
-    fi
-elif command -v ss &> /dev/null; then
-    PIDS=$(timeout 5 ss -tlnp "sport = :$PORT" 2>/dev/null | grep -Po 'pid=\K[0-9]+') || true
-    if [ -n "$PIDS" ]; then
-        echo "发现占用进程 PID: $PIDS，正在强制终止..."
-        kill -9 $PIDS 2>/dev/null || true
-        sleep 1
-    fi
-else
-    log "未找到 lsof 或 ss，跳过端口清理。"
-fi
+log "正在清理端口 $PORT 上的占用进程..."
 
+cleanup_port() {
+    local port=$1
+
+    # 方法1：lsof
+    if command -v lsof &> /dev/null; then
+        local pids=$(timeout 5 lsof -ti :"$port" 2>/dev/null) || true
+        if [ -n "$pids" ]; then
+            echo "发现占用进程 PID: $pids (via lsof)，正在终止..."
+            kill -9 $pids 2>/dev/null || true
+            sleep 1
+            return 0
+        fi
+    fi
+
+    # 方法2：ss
+    if command -v ss &> /dev/null; then
+        local pids=$(timeout 5 ss -tlnp "sport = :$port" 2>/dev/null | grep -Po 'pid=\K[0-9]+') || true
+        if [ -n "$pids" ]; then
+            echo "发现占用进程 PID: $pids (via ss)，正在终止..."
+            kill -9 $pids 2>/dev/null || true
+            sleep 1
+            return 0
+        fi
+    fi
+
+    # 方法3：fuser
+    if command -v fuser &> /dev/null; then
+        if timeout 5 fuser -k -KILL ${port}/tcp 2>/dev/null; then
+            sleep 1
+            return 0
+        fi
+    fi
+
+    # 方法4：解析 /proc/net/tcp（终极 fallback）
+    if [ -f /proc/net/tcp ]; then
+        local inode=$(awk -v port="$(printf '%04X' "$port")" '$2 ~ /:'"$port"'$/{print $10}' /proc/net/tcp 2>/dev/null | head -1)
+        if [ -n "$inode" ]; then
+            local pid=$(find /proc/[0-9]*/fd -lname "socket:\[$inode\]" 2>/dev/null | cut -d/ -f3 | head -1)
+            if [ -n "$pid" ]; then
+                echo "发现占用进程 PID: $pid (via /proc)，正在终止..."
+                kill -9 "$pid" 2>/dev/null || true
+                sleep 1
+                return 0
+            fi
+        fi
+    fi
+
+    return 1
+}
+
+cleanup_port "$PORT" || log "未找到可用的端口检查工具，跳过端口清理（端口可能已被占用）。"
+
+# 二次确认端口状态
 log "验证端口 $PORT 是否已释放..."
 if command -v lsof &> /dev/null; then
     REMAIN=$(timeout 5 lsof -ti :"$PORT" 2>/dev/null) || true
 elif command -v ss &> /dev/null; then
     REMAIN=$(timeout 5 ss -tlnp "sport = :$PORT" 2>/dev/null | grep -q ":$PORT" && echo "1") || true
+elif command -v fuser &> /dev/null; then
+    REMAIN=$(timeout 5 fuser ${PORT}/tcp 2>/dev/null) || true
 else
     REMAIN=""
 fi
@@ -124,6 +169,7 @@ if [ -n "$REMAIN" ]; then
 fi
 log "端口 $PORT 已释放。"
 
+# 清理同名残留进程
 pkill -9 -f "$CMD" 2>/dev/null || true
 sleep 1
 log "同名进程清理完成。"
@@ -131,6 +177,7 @@ log "同名进程清理完成。"
 rm -f "$WORK_DIR/hxonline.pid"
 log "已清理 pid 文件。"
 
+# ========== 5. 启动服务 ==========
 start_service() {
     log "正在启动 hxonline..."
     cd "$WORK_DIR" || { log "失败：无法进入目录 $WORK_DIR"; return 1; }
@@ -153,6 +200,7 @@ start_service() {
 RETRY=0
 while [ $RETRY -lt $MAX_RETRY ]; do
     if start_service; then
+        # ========== 6. 获取公网 IP ==========
         get_public_ip() {
             local ip=""
             local services=(
@@ -174,6 +222,7 @@ while [ $RETRY -lt $MAX_RETRY ]; do
                     return 0
                 fi
             done
+            # 本机网卡公网 IP
             ip=$(timeout 3 ip -4 addr show scope global 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
             if [ -n "$ip" ]; then
                 echo "$ip"
@@ -197,8 +246,10 @@ while [ $RETRY -lt $MAX_RETRY ]; do
         echo "=========================================="
         echo "  游戏后端启动成功！"
         echo "=========================================="
-        echo "测试地址：http://${SERVER_IP}:${PORT}/hello"
+        echo "验证地址：http://${SERVER_IP}:${PORT}/hello"
+        echo "联机地址：ws://${SERVER_IP}:${PORT}"
         echo "日志文件：$LOG_FILE"
+        echo "如果无法访问请去服务器防火墙开放端口"
         exit 0
     fi
     RETRY=$((RETRY+1))
